@@ -13,6 +13,7 @@ M5Stack用ToF-90°測距センサーユニット（Unit Mini ToF-90° / U196、V
 リポジトリを取得し、PlatformIOでプロジェクトを開きます。M5StackをUSBで接続して、プロジェクトのディレクトリで次回を実行してください。
 
 git clone https://github.com/bathline/Mini-4WD-Lap-Timer-for-m5stack-core2.git
+
 cd Mini4WDLapTimer
 
 # ビルド
