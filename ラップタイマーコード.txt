@@ -1,0 +1,327 @@
+#include <Arduino.h>
+#include <M5Unified.h>
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <SD.h>
+
+VL53L0X sensor;
+bool sensorOK = false;
+
+unsigned long startTime = 0;
+unsigned long lapRecords[30] = {0}; // 30周分の記録配列
+int lapCount = 0;
+bool isRunning = false;
+
+// 【設定】通過時のチャタリング防止用のマスク時間（0.5秒）
+const unsigned long MASK_TIME_MS = 500; 
+unsigned long lastDetectionTime = 0;
+
+// 【設定】コース幅に合わせた検知距離の閾値 (mm)
+const uint16_t DETECTION_THRESHOLD_MM = 120; 
+
+int scrollOffset = 0; 
+int touchStartY = 0;
+bool isSwiping = false;
+unsigned long lastResetTime = 0;
+
+// ブートメニュー用の状態管理変数
+bool isMenuSelected = false;
+int selectedApp = 0; // 0: LapTimer, 1: Other App
+unsigned long menuBootTimer = 0; // 5秒自動起動用のタイマー
+
+// --- 【Wi-Fi設定】アクセスポイントモードの設定 ---
+const char* ssid = "M5-LapTimer";      
+const char* password = "mini4wdlaptimer"; 
+WiFiServer server(80);                
+
+// カラーマクロの定義
+#define COLOR_DARKGRAY  0x5AEB  
+#define COLOR_LIGHTGRAY 0xC618  
+#define COLOR_PURPLE    0xF81F  
+
+void drawBootMenu(int remainingSeconds) {
+  M5.Display.fillScreen(BLACK);
+  M5.Display.fillRect(0, 0, 320, 40, BLUE);
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 12);
+  M5.Display.print("M5STACK CORE2 BOOT MENU");
+
+  M5.Display.fillRect(20, 70, 280, 50, (selectedApp == 0) ? GREEN : COLOR_DARKGRAY);
+  M5.Display.setTextColor((selectedApp == 0) ? BLACK : WHITE);
+  M5.Display.setCursor(40, 85);
+  M5.Display.print("[>] 1. MINI 4WD LAP TIMER");
+
+  M5.Display.fillRect(20, 135, 280, 50, (selectedApp == 1) ? GREEN : COLOR_DARKGRAY);
+  M5.Display.setTextColor((selectedApp == 1) ? BLACK : WHITE);
+  M5.Display.setCursor(40, 150);
+  M5.Display.print("[ ] 2. DEFAULT ORIGINAL APP");
+
+  M5.Display.fillRect(0, 205, 320, 35, ORANGE);
+  M5.Display.setTextColor(BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 212);
+  M5.Display.printf("Auto Launch in %d s...", remainingSeconds);
+}
+
+void drawUI() {
+  M5.Display.fillScreen(BLACK);
+  
+  M5.Display.fillRect(0, 0, 320, 24, BLUE); 
+  M5.Display.setTextColor(WHITE);
+  M5.Display.setTextSize(2); 
+  M5.Display.setCursor(10, 4);
+  M5.Display.print("MINI 4WD LAP TIMER");
+
+  M5.Display.fillRect(0, 26, 320, 22, BLACK);
+  M5.Display.drawFastHLine(0, 50, 320, COLOR_DARKGRAY);
+
+  M5.Display.fillRect(0, 52, 320, 18, COLOR_DARKGRAY);
+  M5.Display.setTextColor(CYAN);
+  M5.Display.setTextSize(1); 
+  M5.Display.setCursor(15, 57);
+  M5.Display.print("LAP");
+  M5.Display.setCursor(120, 57);
+  M5.Display.print("LAP TIME (s)");
+
+  M5.Display.fillRect(0, 216, 320, 24, NAVY);
+  M5.Display.setCursor(5, 220);
+  M5.Display.setTextColor(YELLOW);
+  M5.Display.setTextSize(1);
+  M5.Display.print("Wi-Fi: M5-LapTimer / IP: 192.168.4.1");
+}
+
+void displayBestTime() {
+  M5.Display.fillRect(0, 26, 320, 22, BLACK); 
+  M5.Display.setTextSize(2); 
+  
+  if (lapCount == 0) {
+    M5.Display.setTextColor(COLOR_PURPLE);
+    M5.Display.setCursor(15, 30);
+    M5.Display.print("BEST LAP: --.--- s");
+    return;
+  }
+
+  unsigned long fastestTime = 99999999;
+  int fastestLapNum = 0;
+  for (int i = 0; i < lapCount; i++) {
+    if (lapRecords[i] < fastestTime) {
+      fastestTime = lapRecords[i];
+      fastestLapNum = i + 1;
+    }
+  }
+
+  M5.Display.setTextColor(COLOR_PURPLE);
+  M5.Display.setCursor(15, 30);
+  M5.Display.printf("BEST: #%d -> %lu.%03lu s", fastestLapNum, fastestTime / 1000, fastestTime % 1000);
+}
+
+void displayLaps() {
+  M5.Display.fillRect(0, 72, 320, 143, BLACK);
+  M5.Display.setTextSize(2); 
+
+  if (lapCount == 0) return;
+
+  unsigned long fastestTime = 99999999;
+  for (int i = 0; i < lapCount; i++) {
+    if (lapRecords[i] < fastestTime) fastestTime = lapRecords[i];
+  }
+
+  int row = 0;
+  for (int i = scrollOffset; i < lapCount && row < 8; i++) {
+    int yPos = 74 + (row * 17); 
+    M5.Display.setTextColor((lapRecords[i] == fastestTime) ? GREEN : YELLOW);
+    M5.Display.setCursor(15, yPos);
+    M5.Display.printf("#%d", i + 1);
+    M5.Display.setCursor(120, yPos);
+    M5.Display.printf("%lu.%03lu", lapRecords[i] / 1000, lapRecords[i] % 1000);
+    M5.Display.drawFastHLine(0, yPos + 15, 320, 0x3186); 
+    row++;
+  }
+}
+
+void resetLaps() {
+  lapCount = 0;
+  isRunning = false;
+  lastDetectionTime = 0;
+  scrollOffset = 0;
+  for (int i = 0; i < 30; i++) lapRecords[i] = 0;
+  drawUI();
+  displayLaps();
+  displayBestTime();
+}
+
+void handleWebClient() {
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  String currentLine = "";
+  while (client.connected()) {
+    if (client.available()) {
+      char c = client.read();
+      if (c == '\n') {
+        if (currentLine.length() == 0) {
+          client.println("HTTP/1.1 200 OK");
+          client.println("Content-Type: text/html; charset=utf-8");
+          client.println("Connection: close");
+          client.println();
+
+          client.println("<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1' http-equiv='refresh' content='3'>");
+          client.println("<style>body{font-family:sans-serif;background:#111;color:#fff;text-align:center;} h1{color:#00f;} .best{font-size:24px;color:#f0f;margin:20px;font-weight:bold;} table{width:90%;margin:auto;border-collapse:collapse;} th,td{padding:12px;border-bottom:1px solid #444;font-size:20px;} th{color:#0cf;} .fastest{color:#0f0;font-weight:bold;} .normal{color:#ff0;} .btn{background:#f00;color:#fff;padding:15px;font-size:18px;border:none;border-radius:5px;margin-top:20px;width:90%;}</style></head><body>");
+          client.println("<h1>🏎️ MINI 4WD LAP TIMER 🏎️</h1>");
+
+          unsigned long fastestTime = 99999999;
+          int fastestLapNum = 0;
+          for (int i = 0; i < lapCount; i++) {
+            if (lapRecords[i] < fastestTime) {
+              fastestTime = lapRecords[i];
+              fastestLapNum = i + 1;
+            }
+          }
+
+          if (lapCount > 0) {
+            client.printf("<div class='best'>🏆 BEST LAP: #%d -> %lu.%03lu s</div>", fastestLapNum, fastestTime / 1000, fastestTime % 1000);
+          } else {
+            client.println("<div class='best'>🏆 BEST LAP: --.--- s</div>");
+          }
+
+          if (currentLine.indexOf("GET /reset") >= 0) {
+            resetLaps();
+          }
+
+          client.println("<table><tr><th>LAP</th><th>LAP TIME (s)</th></tr>");
+          for (int i = lapCount - 1; i >= 0; i--) { 
+            bool isFastest = (lapRecords[i] == fastestTime);
+            client.printf("<tr class='%s'><td>#%d</td><td>%lu.%03lu s</td></tr>", 
+                          isFastest ? "fastest" : "normal", i + 1, lapRecords[i] / 1000, lapRecords[i] % 1000);
+          }
+          client.println("</table>");
+          
+          client.println("<button class='btn' onclick=\"location.href='/reset'\">CLEAR ALL DATA</button>");
+          client.println("</body></html>");
+          break;
+        } else {
+          currentLine = "";
+        }
+      } else if (c != '\r') {
+        currentLine += c;
+      }
+    }
+  }
+  delay(1);
+  client.stop();
+}
+
+void processBootMenuPhase(unsigned long now) {
+  unsigned long elapsedMenu = now - menuBootTimer;
+  int remaining = 5 - (elapsedMenu / 1000);
+
+  static int lastRemaining = 6;
+  if (remaining != lastRemaining && remaining >= 0) {
+    drawBootMenu(remaining);
+    lastRemaining = remaining;
+  }
+
+  if (M5.Touch.getCount() > 0) {
+    auto touchPoint = M5.Touch.getTouchPointRaw(0);
+    if (touchPoint.y >= 70 && touchPoint.y < 120 && selectedApp != 0) {
+      selectedApp = 0;
+      drawBootMenu(remaining);
+      delay(200);
+    } else if (touchPoint.y >= 135 && touchPoint.y < 185 && selectedApp != 1) {
+      selectedApp = 1;
+      drawBootMenu(remaining);
+      delay(200);
+    }
+  }
+
+  if (elapsedMenu >= 5000) {
+    isMenuSelected = true;
+    if (selectedApp == 0) {
+      WiFi.softAP(ssid, password);
+      server.begin();
+      M5.In_I2C.release();
+      Wire.begin(32, 33, 400000);
+      sensor.setBus(&Wire);
+      sensor.setTimeout(200);
+      if (sensor.init()) {
+        sensor.setMeasurementTimingBudget(20000);
+        sensor.startContinuous(20);
+        sensorOK = true;
+      }
+      drawUI();
+      displayLaps();
+      displayBestTime();
+      startTime = millis(); 
+    } else {
+      if (SD.exists("/update.bin")) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setTextColor(WHITE);
+        M5.Display.setCursor(10, 100);
+        M5.Display.print("SD Loading update.bin...");
+        ESP.restart(); 
+      } else {
+        M5.Display.fillRect(20, 135, 280, 50, RED);
+        M5.Display.setTextColor(WHITE);
+        M5.Display.setCursor(40, 150);
+        M5.Display.print("NO update.bin IN SD!");
+        delay(1500);
+        menuBootTimer = millis();
+        isMenuSelected = false;
+        drawBootMenu(5);
+      }
+    }
+  }
+}
+
+void processTouchInput(unsigned long now) {
+  int touchCount = M5.Touch.getCount();
+  if (touchCount <= 0) {
+    isSwiping = false;
+    return;
+  }
+
+  auto touchPoint = M5.Touch.getTouchPointRaw(0);
+  int ty = touchPoint.y;
+
+  if (ty >= 210) {
+    if (now - lastResetTime > 500) {
+      lastResetTime = now;
+      resetLaps();
+    }
+  } else if (ty < 210 && ty > 35) {
+    if (!isSwiping) {
+      touchStartY = ty; 
+      isSwiping = true;
+    } else {
+      int diffY = ty - touchStartY;
+      if (diffY > 12) {
+        if (scrollOffset > 0) {
+          scrollOffset--;
+          displayLaps();
+        }
+        touchStartY = ty; 
+      } else if (diffY < -12) {
+        if (scrollOffset < lapCount - 8) {
+          scrollOffset++;
+          displayLaps();
+        }
+        touchStartY = ty;
+      }
+    }
+  }
+}
+
+void processSensorMeasurement(unsigned long now) {
+  if (!sensorOK) return;
+
+  uint16_t distance = sensor.readRangeContinuousMillimeters();
+  if (sensor.timeoutOccurred()) return;
+
+  // 【バグ修正】引数の「now」と一致していなかった古い記述を完全に修正しました
+  if (distance > 10 && distance < DETECTION_THRESHOLD_MM && (now - lastDetectionTime > MASK_TIME_MS)) {
+    lastDetectionTime = now;
+
+    if (!isRunning) {
