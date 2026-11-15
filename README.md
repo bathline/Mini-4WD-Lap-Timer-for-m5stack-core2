@@ -20,4 +20,5 @@ pio run
 
 # M5Stackへ書き込み
 pio run -t upload
+
 VS CodeのPlatformIOからビルド/アップロードを実行することもできます。
